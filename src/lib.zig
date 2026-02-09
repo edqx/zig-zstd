@@ -88,10 +88,12 @@ pub fn checkError(code: usize) Error!usize {
 pub const Compress = struct {
     inner: *c.ZSTD_CStream,
 
-    source: *std.Io.Reader,
-    reader: std.Io.Reader,
+    output: *std.Io.Writer,
+    writer: std.Io.Writer,
+    
+    unwritten_bytes: usize = 0,
 
-    pub fn init(source: *std.Io.Reader, level: i32) Error!Compress {
+    pub fn init(output: *std.Io.Writer, out_buffer: []u8, level: i32) Error!Compress {
         const c_stream = c.ZSTD_createCStream();
         if (c_stream == null) return error.OutOfMemory;
         
@@ -99,13 +101,13 @@ pub const Compress = struct {
 
         return .{
             .inner = c_stream.?,
-            .source = source,
-            .reader = .{
-                .buffer = &.{},
-                .seek = 0,
+            .output = output,
+            .writer = .{
+                .buffer = out_buffer,
                 .end = 0,
                 .vtable = &.{
-                    .stream = &stream,
+                    .drain = &drain,
+                    .flush = &flush,
                 },
             },
         };
@@ -116,36 +118,15 @@ pub const Compress = struct {
         compress.* = undefined;
     }
     
-    pub fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const compress: *Compress = @fieldParentPtr("reader", reader);
-
-        compress.source.fill(1) catch |e| switch (e) {
-            error.EndOfStream => {
-                const dest = limit.slice(try writer.writableSliceGreedy(1));
-        
-                var out_buffer: c.ZSTD_outBuffer_s = .{
-                    .dst = dest.ptr,
-                    .size = dest.len,
-                    .pos = 0,
-                };
-        
-                _ = checkError(c.ZSTD_endStream(compress.inner, &out_buffer)) catch return error.ReadFailed;
-                
-                writer.advance(out_buffer.pos);
-                return error.EndOfStream;
-            },
-            else => return e,
-        };
-        
-        const src = compress.source.buffered();
+    fn writeImpl(compress: *Compress, slice: []const u8) std.Io.Writer.Error!usize {
+        const dest = try compress.output.writableSliceGreedy(1);
+        const actual_writable = slice[0..@min(slice.len, dest.len)];
         
         var in_buffer: c.ZSTD_inBuffer_s = .{
-            .src = src.ptr,
-            .size = src.len,
+            .src = actual_writable.ptr,
+            .size = actual_writable.len,
             .pos = 0,
         };
-        
-        const dest = limit.slice(try writer.writableSliceGreedy(1));
         
         var out_buffer: c.ZSTD_outBuffer_s = .{
             .dst = dest.ptr,
@@ -153,12 +134,58 @@ pub const Compress = struct {
             .pos = 0,
         };
         
+        _ = checkError(c.ZSTD_compressStream(compress.inner, &out_buffer, &in_buffer)) catch return error.WriteFailed;
         
-        _ = checkError(c.ZSTD_compressStream(compress.inner, &out_buffer, &in_buffer)) catch return error.ReadFailed;
+        compress.unwritten_bytes += dest.len - out_buffer.pos;
+        compress.output.advance(out_buffer.pos);
+        _ = compress.writer.consume(in_buffer.pos);
+        return in_buffer.pos;
+    }
     
-        compress.source.toss(in_buffer.pos);
-        writer.advance(out_buffer.pos);
-        return out_buffer.pos;
+    pub fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const compress: *Compress = @fieldParentPtr("writer", writer);
+        
+        const pattern = data[data.len - 1];
+        
+        var total: usize = 0;
+        
+        total += try compress.writeImpl(writer.buffered());
+        for (data[0..data.len - 1]) |slice| {
+            total += try compress.writeImpl(slice);
+        }
+        for (0..splat) |_| {
+            total += try compress.writeImpl(pattern);
+        }
+        return total;
+    }
+    
+    pub fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        const compress: *Compress = @fieldParentPtr("writer", writer);
+        try compress.writer.defaultFlush();
+
+        const dest = try compress.output.writableSliceGreedy(compress.unwritten_bytes);
+        var out_buffer: c.ZSTD_outBuffer_s = .{
+            .dst = dest.ptr,
+            .size = dest.len,
+            .pos = 0,
+        };
+        _ = checkError(c.ZSTD_flushStream(compress.inner, &out_buffer)) catch return error.WriteFailed;
+        compress.output.advance(out_buffer.pos);
+        try compress.output.flush();
+    }
+    
+    pub fn end(compress: *Compress) std.Io.Writer.Error!void {
+        try compress.writer.defaultFlush();
+
+        const dest = try compress.output.writableSliceGreedy(compress.unwritten_bytes);
+        var out_buffer: c.ZSTD_outBuffer_s = .{
+            .dst = dest.ptr,
+            .size = dest.len,
+            .pos = 0,
+        };
+        _ = checkError(c.ZSTD_endStream(compress.inner, &out_buffer)) catch return error.WriteFailed;
+        compress.output.advance(out_buffer.pos);
+        try compress.output.flush();
     }
 };
 
@@ -166,13 +193,17 @@ test Compress {
     const gpa = std.testing.allocator;
 
     const data = "BARNEY BARNEY BARNEY BARNEY";
-    var reader: std.Io.Reader = .fixed(data);
+    
+    var compressed_writer: std.Io.Writer.Allocating = .init(gpa);
+    defer compressed_writer.deinit();
+    
+    var buffer: [64]u8 = undefined;
 
-    var compress: Compress = try .init(&reader, 1);
+    var compress: Compress = try .init(&compressed_writer.writer, &buffer, 1);
     defer compress.deinit();
     
-    const compressed = try compress.reader.allocRemaining(gpa, .unlimited);
-    defer gpa.free(compressed);
-    
-    try std.testing.expectEqualSlices(u8, &.{ 40, 181, 47, 253, 0, 72, 109, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 }, compressed);
+    try compress.writer.writeAll(data);
+    try compress.writer.flush();
+
+    try std.testing.expectEqualSlices(u8, &.{ 40, 181, 47, 253, 0, 72, 108, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 }, compressed_writer.written());
 }
