@@ -84,3 +84,95 @@ pub fn checkError(code: usize) Error!usize {
         };
     return code;
 }
+
+pub const Compress = struct {
+    inner: *c.ZSTD_CStream,
+
+    source: *std.Io.Reader,
+    reader: std.Io.Reader,
+
+    pub fn init(source: *std.Io.Reader, level: i32) Error!Compress {
+        const c_stream = c.ZSTD_createCStream();
+        if (c_stream == null) return error.OutOfMemory;
+        
+        _ = try checkError(c.ZSTD_initCStream(c_stream, level));
+
+        return .{
+            .inner = c_stream.?,
+            .source = source,
+            .reader = .{
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+                .vtable = &.{
+                    .stream = &stream,
+                },
+            },
+        };
+    }
+    
+    pub fn deinit(compress: *Compress) void {
+        _ = c.ZSTD_freeCStream(compress.inner);
+        compress.* = undefined;
+    }
+    
+    pub fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const compress: *Compress = @fieldParentPtr("reader", reader);
+
+        compress.source.fill(1) catch |e| switch (e) {
+            error.EndOfStream => {
+                const dest = limit.slice(try writer.writableSliceGreedy(1));
+        
+                var out_buffer: c.ZSTD_outBuffer_s = .{
+                    .dst = dest.ptr,
+                    .size = dest.len,
+                    .pos = 0,
+                };
+        
+                _ = checkError(c.ZSTD_endStream(compress.inner, &out_buffer)) catch return error.ReadFailed;
+                
+                writer.advance(out_buffer.pos);
+                return error.EndOfStream;
+            },
+            else => return e,
+        };
+        
+        const src = compress.source.buffered();
+        
+        var in_buffer: c.ZSTD_inBuffer_s = .{
+            .src = src.ptr,
+            .size = src.len,
+            .pos = 0,
+        };
+        
+        const dest = limit.slice(try writer.writableSliceGreedy(1));
+        
+        var out_buffer: c.ZSTD_outBuffer_s = .{
+            .dst = dest.ptr,
+            .size = dest.len,
+            .pos = 0,
+        };
+        
+        
+        _ = checkError(c.ZSTD_compressStream(compress.inner, &out_buffer, &in_buffer)) catch return error.ReadFailed;
+    
+        compress.source.toss(in_buffer.pos);
+        writer.advance(out_buffer.pos);
+        return out_buffer.pos;
+    }
+};
+
+test Compress {
+    const gpa = std.testing.allocator;
+
+    const data = "BARNEY BARNEY BARNEY BARNEY";
+    var reader: std.Io.Reader = .fixed(data);
+
+    var compress: Compress = try .init(&reader, 1);
+    defer compress.deinit();
+    
+    const compressed = try compress.reader.allocRemaining(gpa, .unlimited);
+    defer gpa.free(compressed);
+    
+    try std.testing.expectEqualSlices(u8, &.{ 40, 181, 47, 253, 0, 72, 109, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 }, compressed);
+}

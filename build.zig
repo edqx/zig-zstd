@@ -190,6 +190,7 @@ const compression_sources: []const []const u8 = &.{
     "compress/zstd_ldm.c",
     "compress/zstd_lazy.c",
     "compress/zstd_fast.c",
+    "compress/zstd_preSplit.c"
 };
 
 const decompress_sources: []const []const u8 = &.{
