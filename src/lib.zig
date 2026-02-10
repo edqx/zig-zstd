@@ -90,6 +90,9 @@ pub const Compress = struct {
 
     output: *std.Io.Writer,
     writer: std.Io.Writer,
+    
+    uncompressed_size: usize = 0,
+    compressed_size: usize = 0,
 
     pub fn init(output: *std.Io.Writer, out_buffer: []u8, level: i32) Error!Compress {
         const c_stream = c.ZSTD_createCStream();
@@ -133,7 +136,9 @@ pub const Compress = struct {
 
         _ = checkError(c.ZSTD_compressStream(compress.inner, &out_buffer, &in_buffer)) catch return error.WriteFailed;
 
+        compress.compressed_size += out_buffer.pos;
         compress.output.advance(out_buffer.pos);
+        compress.uncompressed_size += in_buffer.pos;
         _ = compress.writer.consume(in_buffer.pos);
         return in_buffer.pos;
     }
@@ -174,6 +179,7 @@ pub const Compress = struct {
                 .pos = 0,
             };
             const num2 = checkError(c.ZSTD_endStream(compress.inner, &out_buffer)) catch return error.WriteFailed;
+            compress.compressed_size += out_buffer.pos;
             compress.output.advance(out_buffer.pos);
             if (num2 == 0) break;
         }
@@ -186,6 +192,7 @@ test Compress {
     const gpa = std.testing.allocator;
 
     const data = "BARNEY BARNEY BARNEY BARNEY";
+    const expected_compressed: []const u8 = &.{ 40, 181, 47, 253, 0, 72, 109, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 };
     
     var compressed_writer: std.Io.Writer.Allocating = .init(gpa);
     defer compressed_writer.deinit();
@@ -200,5 +207,7 @@ test Compress {
 
     try compress.end();
 
-    try std.testing.expectEqualSlices(u8, &.{ 40, 181, 47, 253, 0, 72, 109, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 }, compressed_writer.written());
+    try std.testing.expectEqualSlices(u8, expected_compressed, compressed_writer.written());
+    try std.testing.expectEqual(expected_compressed.len, compress.compressed_size);
+    try std.testing.expectEqual(data.len, compress.uncompressed_size);
 }
