@@ -90,8 +90,6 @@ pub const Compress = struct {
 
     output: *std.Io.Writer,
     writer: std.Io.Writer,
-    
-    unwritten_bytes: usize = 0,
 
     pub fn init(output: *std.Io.Writer, out_buffer: []u8, level: i32) Error!Compress {
         const c_stream = c.ZSTD_createCStream();
@@ -107,7 +105,6 @@ pub const Compress = struct {
                 .end = 0,
                 .vtable = &.{
                     .drain = &drain,
-                    .flush = &flush,
                 },
             },
         };
@@ -133,10 +130,9 @@ pub const Compress = struct {
             .size = dest.len,
             .pos = 0,
         };
-        
+
         _ = checkError(c.ZSTD_compressStream(compress.inner, &out_buffer, &in_buffer)) catch return error.WriteFailed;
-        
-        compress.unwritten_bytes += dest.len - out_buffer.pos;
+
         compress.output.advance(out_buffer.pos);
         _ = compress.writer.consume(in_buffer.pos);
         return in_buffer.pos;
@@ -149,42 +145,39 @@ pub const Compress = struct {
         
         var total: usize = 0;
         
-        total += try compress.writeImpl(writer.buffered());
+        const n1 = try compress.writeImpl(writer.buffered());
+        total += n1;
+        if (n1 < writer.buffered().len) return total;
+
         for (data[0..data.len - 1]) |slice| {
-            total += try compress.writeImpl(slice);
+            const n2 = try compress.writeImpl(slice);
+            total += n2;
+            if (n2 < slice.len) return total;
         }
         for (0..splat) |_| {
-            total += try compress.writeImpl(pattern);
+            const n3 = try compress.writeImpl(pattern);
+            total += n3;
+            if (n3 < pattern.len) return total;
         }
-        return total;
-    }
-    
-    pub fn flush(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        const compress: *Compress = @fieldParentPtr("writer", writer);
-        try compress.writer.defaultFlush();
 
-        const dest = try compress.output.writableSliceGreedy(compress.unwritten_bytes);
-        var out_buffer: c.ZSTD_outBuffer_s = .{
-            .dst = dest.ptr,
-            .size = dest.len,
-            .pos = 0,
-        };
-        _ = checkError(c.ZSTD_flushStream(compress.inner, &out_buffer)) catch return error.WriteFailed;
-        compress.output.advance(out_buffer.pos);
-        try compress.output.flush();
+        return total;
     }
     
     pub fn end(compress: *Compress) std.Io.Writer.Error!void {
         try compress.writer.defaultFlush();
 
-        const dest = try compress.output.writableSliceGreedy(compress.unwritten_bytes);
-        var out_buffer: c.ZSTD_outBuffer_s = .{
-            .dst = dest.ptr,
-            .size = dest.len,
-            .pos = 0,
-        };
-        _ = checkError(c.ZSTD_endStream(compress.inner, &out_buffer)) catch return error.WriteFailed;
-        compress.output.advance(out_buffer.pos);
+        while (true) {
+            const dest = try compress.output.writableSliceGreedy(1);
+            var out_buffer: c.ZSTD_outBuffer_s = .{
+                .dst = dest.ptr,
+                .size = dest.len,
+                .pos = 0,
+            };
+            const num2 = checkError(c.ZSTD_endStream(compress.inner, &out_buffer)) catch return error.WriteFailed;
+            compress.output.advance(out_buffer.pos);
+            if (num2 == 0) break;
+        }
+        
         try compress.output.flush();
     }
 };
@@ -196,8 +189,8 @@ test Compress {
     
     var compressed_writer: std.Io.Writer.Allocating = .init(gpa);
     defer compressed_writer.deinit();
-    
-    var buffer: [64]u8 = undefined;
+
+    var buffer: [1]u8 = undefined;
 
     var compress: Compress = try .init(&compressed_writer.writer, &buffer, 1);
     defer compress.deinit();
@@ -205,5 +198,7 @@ test Compress {
     try compress.writer.writeAll(data);
     try compress.writer.flush();
 
-    try std.testing.expectEqualSlices(u8, &.{ 40, 181, 47, 253, 0, 72, 108, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 }, compressed_writer.written());
+    try compress.end();
+
+    try std.testing.expectEqualSlices(u8, &.{ 40, 181, 47, 253, 0, 72, 109, 0, 0, 56, 66, 65, 82, 78, 69, 89, 32, 1, 0, 162, 139, 17 }, compressed_writer.written());
 }
