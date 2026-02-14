@@ -85,6 +85,62 @@ pub fn checkError(code: usize) Error!usize {
     return code;
 }
 
+pub const Decompress = struct {
+    inner: *c.ZSTD_DStream,
+
+    source: *std.Io.Reader,
+    reader: std.Io.Reader,
+
+    pub fn init(source: *std.Io.Reader) Error!Decompress {
+        const c_stream = c.ZSTD_createDStream();
+        if (c_stream == null) return error.OutOfMemory;
+
+        return .{
+            .inner = c_stream.?,
+            .source = source,
+            .reader = .{
+                .buffer = &.{},
+                .seek = 0,
+                .end = 0,
+                .vtable = &.{
+                    .stream = &stream,
+                },
+            },
+        };
+    }
+    
+    pub fn deinit(decompress: *Decompress) void {
+        _ = c.ZSTD_freeDStream(decompress.inner);
+        decompress.* = undefined;
+    }
+    
+    pub fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const decompress: *Decompress = @fieldParentPtr("reader", reader);
+        
+        const src = try decompress.source.peekGreedy(1);
+        
+        var in_buffer: c.ZSTD_inBuffer_s = .{
+            .src = src.ptr,
+            .size = src.len,
+            .pos = 0,
+        };
+        
+        const dest = limit.slice(try writer.writableSliceGreedy(1));
+        
+        var out_buffer: c.ZSTD_outBuffer_s = .{
+            .dst = dest.ptr,
+            .size = dest.len,
+            .pos = 0,
+        };
+
+        _ = checkError(c.ZSTD_decompressStream(decompress.inner, &out_buffer, &in_buffer)) catch return error.ReadFailed;
+        
+        decompress.source.toss(in_buffer.pos);
+        writer.advance(out_buffer.pos);
+        return out_buffer.pos;
+    }
+};
+
 pub const Compress = struct {
     inner: *c.ZSTD_CStream,
 
@@ -120,11 +176,10 @@ pub const Compress = struct {
     
     fn writeImpl(compress: *Compress, slice: []const u8) std.Io.Writer.Error!usize {
         const dest = try compress.output.writableSliceGreedy(1);
-        const actual_writable = slice[0..@min(slice.len, dest.len)];
-        
+
         var in_buffer: c.ZSTD_inBuffer_s = .{
-            .src = actual_writable.ptr,
-            .size = actual_writable.len,
+            .src = slice.ptr,
+            .size = slice.len,
             .pos = 0,
         };
         
@@ -138,9 +193,9 @@ pub const Compress = struct {
 
         compress.compressed_size += out_buffer.pos;
         compress.output.advance(out_buffer.pos);
+
         compress.uncompressed_size += in_buffer.pos;
-        _ = compress.writer.consume(in_buffer.pos);
-        return in_buffer.pos;
+        return compress.writer.consume(in_buffer.pos);
     }
     
     pub fn drain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -148,24 +203,18 @@ pub const Compress = struct {
         
         const pattern = data[data.len - 1];
         
-        var total: usize = 0;
+        const buffered = writer.buffered();
+        if (buffered.len > 0) {
+            return try compress.writeImpl(buffered);
+        }
         
-        const n1 = try compress.writeImpl(writer.buffered());
-        total += n1;
-        if (n1 < writer.buffered().len) return total;
-
         for (data[0..data.len - 1]) |slice| {
-            const n2 = try compress.writeImpl(slice);
-            total += n2;
-            if (n2 < slice.len) return total;
+            if (slice.len == 0) continue;
+            return try compress.writeImpl(slice);
         }
-        for (0..splat) |_| {
-            const n3 = try compress.writeImpl(pattern);
-            total += n3;
-            if (n3 < pattern.len) return total;
-        }
-
-        return total;
+        
+        if (pattern.len == 0 or splat == 0) return 0;
+        return try compress.writeImpl(pattern);
     }
     
     pub fn end(compress: *Compress) std.Io.Writer.Error!void {
@@ -183,8 +232,6 @@ pub const Compress = struct {
             compress.output.advance(out_buffer.pos);
             if (num2 == 0) break;
         }
-        
-        try compress.output.flush();
     }
 };
 
