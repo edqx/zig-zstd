@@ -50,6 +50,8 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    
+    zstd.bundle_ubsan_rt = true;
 
     b.installArtifact(zstd);
 
