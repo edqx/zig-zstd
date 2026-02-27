@@ -86,12 +86,20 @@ pub fn checkError(code: usize) Error!usize {
 }
 
 pub const Decompress = struct {
+    pub fn getRecommendedInputSize() usize {
+        return c.ZSTD_DStreamInSize();
+    }
+
+    pub fn getRecommendedOutputSize() usize {
+        return c.ZSTD_DStreamOutSize();
+    }
+
     inner: *c.ZSTD_DStream,
 
     source: *std.Io.Reader,
     reader: std.Io.Reader,
 
-    pub fn init(source: *std.Io.Reader) Error!Decompress {
+    pub fn init(source: *std.Io.Reader, buffer: []u8) Error!Decompress {
         const c_stream = c.ZSTD_createDStream();
         if (c_stream == null) return error.OutOfMemory;
 
@@ -99,7 +107,7 @@ pub const Decompress = struct {
             .inner = c_stream.?,
             .source = source,
             .reader = .{
-                .buffer = &.{},
+                .buffer = buffer,
                 .seek = 0,
                 .end = 0,
                 .vtable = &.{
@@ -142,6 +150,14 @@ pub const Decompress = struct {
 };
 
 pub const Compress = struct {
+    pub fn getRecommendedInputSize() usize {
+        return c.ZSTD_CStreamInSize();
+    }
+
+    pub fn getRecommendedOutputSize() usize {
+        return c.ZSTD_CStreamOutSize();
+    }
+
     inner: *c.ZSTD_CStream,
 
     output: *std.Io.Writer,
